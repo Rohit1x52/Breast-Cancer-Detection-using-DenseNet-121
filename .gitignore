@@ -4,6 +4,7 @@
 # EXCEPT keep DenseNet files & essential project files
 !.gitignore
 !requirements.txt
+!README.md
 
 # Keep DenseNet code
 !densenet.py
