@@ -18,8 +18,8 @@ BreakHis/**/*.jpg
 
 # Keep figures folder but ignore large images
 !figures/
-figures/*.png
-figures/*.jpg
+!figures/**/*.png
+!figures/**/*.jpg
 
 # Ignore model weights except DenseNet
 *.pth
