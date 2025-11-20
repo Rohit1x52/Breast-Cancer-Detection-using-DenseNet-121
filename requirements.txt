@@ -1,0 +1,27 @@
+# Core Python Libraries
+numpy
+pandas
+scikit-learn
+scipy
+
+# Deep Learning
+torch
+torchvision
+torchaudio
+
+# Image Processing & Computer Vision
+opencv-python
+Pillow
+scikit-image
+tqdm
+
+# Visualization
+matplotlib
+seaborn
+
+# Explainability / Interpretation
+shap
+lime
+
+# Web App (Frontend)
+streamlit

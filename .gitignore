@@ -1,0 +1,60 @@
+# Ignore everything
+*
+
+# EXCEPT keep DenseNet files & essential project files
+!.gitignore
+!requirements.txt
+
+# Keep DenseNet code
+!densenet.py
+!densenet.ipynb
+
+# Keep BreakHis folder (dataset structure only, no images)
+!BreakHis/
+BreakHis/*.png
+BreakHis/*.jpg
+BreakHis/**/*.png
+BreakHis/**/*.jpg
+
+# Keep figures folder but ignore large images
+!figures/
+figures/*.png
+figures/*.jpg
+
+# Ignore model weights except DenseNet
+*.pth
+!best_densenet_model.pth
+!best_hybrid_densenet.pth
+
+# Ignore ResNet-related feature files
+features_test_resnet50.npy
+features_train_resnet50.npy
+features_val_resnet50.npy
+
+# Ignore label files if they are resnet related
+labels_test.npy
+labels_train.npy
+labels_val.npy
+
+# Ignore hybrid / resnet pipelines
+best_hybrid_model.pth
+Breast_Cancer_Model.pth
+dense_hybrid_features_splits.npz
+dense_hybrid_pca.joblib
+dense_hybrid_scaler.joblib
+resnet.py
+resnet_Kaggle.ipynb
+nlp.ipynb
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore any logs, temp, cache
+*.log
+*.tmp
+__pycache__/
+*.pyc
