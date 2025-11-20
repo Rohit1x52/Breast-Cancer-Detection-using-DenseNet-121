@@ -16,8 +16,9 @@ BreakHis/*.jpg
 BreakHis/**/*.png
 BreakHis/**/*.jpg
 
-# Keep figures folder but ignore large images
+# Keep figures folder with all subfolders and images
 !figures/
+!figures/**
 !figures/**/*.png
 !figures/**/*.jpg
 
