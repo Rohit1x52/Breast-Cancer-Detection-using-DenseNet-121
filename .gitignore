@@ -10,46 +10,27 @@
 !densenet.py
 !densenet.ipynb
 
-# Keep BreakHis folder (dataset structure only, no images)
-!BreakHis/
-BreakHis/*.png
-BreakHis/*.jpg
-BreakHis/**/*.png
-BreakHis/**/*.jpg
+# Ignore datasets and generated figures
+BreakHis/
+figures/
 
-# Keep figures folder with all subfolders and images
-!figures/
-!figures/**
-!figures/**/*.png
-!figures/**/*.jpg
-
-# Ignore model weights except DenseNet
+# Ignore model weights and artifacts
 *.pth
-!best_densenet_model.pth
-!best_hybrid_densenet.pth
-
-# Ignore ResNet-related feature files
-features_test_resnet50.npy
-features_train_resnet50.npy
-features_val_resnet50.npy
-
-# Ignore label files if they are resnet related
-labels_test.npy
-labels_train.npy
-labels_val.npy
+*.npy
+*.npz
+*.joblib
 
 # Ignore hybrid / resnet pipelines
-best_hybrid_model.pth
-Breast_Cancer_Model.pth
-dense_hybrid_features_splits.npz
-dense_hybrid_pca.joblib
-dense_hybrid_scaler.joblib
 resnet.py
 resnet_Kaggle.ipynb
 nlp.ipynb
 
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
+
+# Ignore secrets / environment
+.env
+.env.*
 
 # Ignore OS files
 .DS_Store
