@@ -1,133 +1,185 @@
-# Breast Cancer Classification using DenseNet-121 (Hybrid Model)
+<div align="center">
 
-- This repository contains a hybrid deep-learning model built using DenseNet-121 + engineered radiomics features to classify breast histopathology images (benign vs malignant).
-The project is part of my PBL work on early detection of breast cancer using AI.
+# Breast Cancer Detection
 
-##  Project Overview
+### Hybrid DenseNet-121 with Radiomic Feature Fusion and NLP-Powered Report Generation
 
-- Breast cancer detection from microscopic images is challenging because cancer cells often show very subtle texture changes. To improve accuracy, this project combines:
+[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C?style=for-the-badge&logo=pytorch&logoColor=white)](https://pytorch.org)
+[![Streamlit](https://img.shields.io/badge/Streamlit-App-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)](https://streamlit.io)
+[![Gemini](https://img.shields.io/badge/Gemini-NLP%20Reports-4285F4?style=for-the-badge&logo=google&logoColor=white)](https://aistudio.google.com)
 
--  DenseNet-121 deep features (pretrained on ImageNet)
--  Engineered radiomics features (GLCM, LBP, HOG, FFT, intensity stats, morphology)
--  A fully-connected classifier trained on the fused feature vector
+---
 
-- This hybrid format helps the model learn both high-level patterns and fine-texture details, leading to powerful performance even with limited data.
+A hybrid deep learning system that fuses **DenseNet-121 CNN features** with **engineered radiomic descriptors** for accurate breast histopathology classification (benign vs malignant), enhanced with **AI-generated clinical reports** via Google Gemini.
 
-## Dataset — BreakHis
+</div>
 
-- The model is trained on the BreakHis dataset, which contains:
+---
 
-- 7,909 breast cancer histopathology images
+## Architecture
 
-- H&E-stained slides
+```
+                    Input Image (224 x 224)
+                           |
+              +------------+------------+
+              |                         |
+     DenseNet-121 Backbone     Radiomic Feature Extraction
+     (ImageNet pretrained)     (GLCM, LBP, HOG, FFT, etc.)
+              |                         |
+        1024-D features           147-D features
+              |                         |
+              |                    MLP Encoder
+              |                    (256 -> 128)
+              |                         |
+              +-------Concatenate-------+
+                           |
+                     Fusion Classifier
+                     (1152 -> 512 -> 128 -> 1)
+                           |
+                    Benign / Malignant
+                           |
+                  Grad-CAM Heatmap + Gemini NLP Report
+```
 
-- Classes: Benign and Malignant
+## Key Features
 
-- Magnifications: 40×, 100×, 200×, 400×
+- **Hybrid Fusion Model** -- Combines deep CNN features with hand-crafted radiomic descriptors for robust classification
+- **Grad-CAM Explainability** -- Visual heatmaps highlighting regions the model focuses on for its decision
+- **NLP Clinical Reports** -- Automatic generation of professional pathology-style reports using Google Gemini
+- **Interactive Web App** -- Streamlit-based interface for image upload, prediction, and interpretation
+- **Graceful Fallback** -- Works fully offline with static explanations when no API key is configured
 
-Dataset Link:
-https://www.kaggle.com/datasets/ambarish/breakhis
+## Dataset
 
-## Method Summary
-1. Preprocessing
+The model is trained on the [BreakHis](https://www.kaggle.com/datasets/ambarish/breakhis) dataset:
 
-- Resize images → 224×224
+| Property          | Value                                   |
+|-------------------|-----------------------------------------|
+| Total images      | 7,909                                   |
+| Staining          | H&E (Hematoxylin and Eosin)             |
+| Classes           | Benign, Malignant                       |
+| Magnifications    | 40x, 100x, 200x, 400x                  |
+| Image format      | PNG (700 x 460)                         |
 
-- Normalize using ImageNet mean & std
+## Method
 
-- Augmentation: flips, rotation, color jitter
+### 1. Preprocessing
 
-2. DenseNet-121 Feature Extraction
+- Resize to 224 x 224
+- Normalize with ImageNet mean and standard deviation
+- Augmentation: random flips, rotation, color jitter
 
-- Load pretrained DenseNet-121
+### 2. DenseNet-121 Feature Extraction
 
-- Remove classifier → output 1024-dim vector
+- Pretrained DenseNet-121 with classifier head removed
+- Outputs a 1024-dimensional feature vector per image
+- Early layers frozen; last dense block fine-tuned
 
-- Freeze early layers + fine-tune last dense block
+### 3. Radiomic Feature Engineering (147 features)
 
-3. Engineered Feature Extraction
+| Category                | Features                                           |
+|-------------------------|----------------------------------------------------|
+| Texture (GLCM)          | Contrast, correlation, energy, homogeneity         |
+| Micro-texture (LBP)     | Local binary pattern histogram                     |
+| Gradient (HOG)          | Histogram of oriented gradients                    |
+| Intensity Statistics    | Mean, variance, skewness, kurtosis                 |
+| Edge Descriptors        | Canny edges, Sobel gradients, Laplacian variance   |
+| Frequency Domain (FFT)  | Fourier transform magnitude features               |
+| Morphology              | Area, perimeter, solidity, eccentricity             |
 
-- Extracted features:
+### 4. Feature Fusion and Classification
 
-- GLCM texture statistics
+- Concatenate DenseNet (1024-D) + Radiomic (128-D after MLP encoding)
+- StandardScaler normalization and PCA (95% variance retained)
+- Fully connected classifier with BatchNorm and Dropout
 
-- LBP micro-texture features
+### 5. Training Configuration
 
-- HOG gradients
+| Parameter     | Value              |
+|---------------|--------------------|
+| Loss          | BCEWithLogitsLoss  |
+| Optimizer     | AdamW              |
+| Scheduler     | ReduceLROnPlateau  |
+| Batch size    | 32                 |
 
-- Intensity statistics (mean, variance, skewness, kurtosis)
+### 6. NLP Report Generation
 
-- Edge/gradient descriptors (Canny, Sobel, Laplacian variance)
+After classification, the model's prediction, confidence score, and Grad-CAM activation statistics are passed to **Google Gemini** to generate a structured clinical report including:
 
-- FFT frequency features
+- Clinical summary interpreting the computational findings
+- Key tissue/cellular features associated with the classification
+- Recommended next steps
 
-- Morphology features (area, perimeter, solidity, eccentricity)
+Reports include a disclaimer that they are AI-generated and require pathologist review.
 
-4. Feature Fusion
+## Results
 
-- DenseNet features (1024) + Radiomics (~147)
+| Metric                | Score   |
+|-----------------------|---------|
+| Accuracy              | 0.9560  |
+| Balanced Accuracy     | 0.9438  |
+| Precision             | 0.9658  |
+| Recall (Sensitivity)  | 0.9727  |
+| Specificity           | 0.9150  |
+| F1 Score              | 0.9692  |
+| ROC-AUC               | 0.9854  |
+| Cohen's Kappa         | 0.8923  |
+| Matthews Correlation  | 0.8923  |
+| Brier Score           | 0.0360  |
 
-- Apply StandardScaler
+**Confusion Matrix:**
 
-- Apply PCA (retain 95% variance)
+|                  | Predicted Benign | Predicted Malignant |
+|------------------|------------------|---------------------|
+| Actual Benign    | 312 (TN)         | 29 (FP)             |
+| Actual Malignant | 23 (FN)          | 818 (TP)            |
 
-- Feed into a fully connected classifier
+**Optimal Threshold (Youden Index):** 0.598 | Accuracy at threshold: 0.9552
 
-5. Training
+## Setup
 
-- Loss: BCEWithLogits
+```bash
+# Clone the repository
+git clone https://github.com/Rohit1x52/Breast-Cancer-Detection-using-DenseNet-121.git
+cd Breast-Cancer-Detection-using-DenseNet-121
 
-- Optimizer: AdamW
+# Install dependencies
+pip install -r requirements.txt
 
-- Scheduler: ReduceLROnPlateau
+# (Optional) Configure NLP report generation
+# Get a free API key from https://aistudio.google.com/apikey
+echo GEMINI_API_KEY="your-api-key-here" > .env
 
-- Metrics: Accuracy, Precision, Recall, AUC, F1, Confusion Matrix
+# Run the application
+streamlit run densenet.py
+```
 
-## 📊 Results
+## Project Structure
 
-- The hybrid model achieved strong performance on the BreakHis test split:
+```
+.
+├── densenet.py               # Main Streamlit app (inference + NLP reports)
+├── densenet.ipynb             # Training notebook
+├── best_hybrid_densenet.pth   # Trained model weights
+├── requirements.txt           # Python dependencies
+├── .env                       # API key (not tracked by git)
+├── BreakHis/                  # Dataset directory
+└── figures/                   # Training plots and visualizations
+```
 
-- Metric	Score
-- Accuracy	0.9560
-- Balanced Accuracy	0.9438
-- Precision	0.9658
-- Recall (Sensitivity)	0.9727
-- Specificity	0.9150
-- F1 Score	0.9692
-- ROC-AUC	0.9854
-- Cohen’s Kappa	0.8923
-- Matthews CC	0.8923
-- Brier Score	0.0360
-- Confusion Matrix
+## Future Work
 
-- True Positives: 818
+- Training on larger datasets (CBIS-DDSM, VinDr-Mammo)
+- Vision Transformer (ViT) backbone comparison
+- Multi-magnification learning pipeline
+- Advanced explainability (Score-CAM, Integrated Gradients)
+- RAG-based Q&A chatbot for interactive diagnosis queries
 
-- True Negatives: 312
+---
 
-- False Positives: 29
+<div align="center">
 
-- False Negatives: 23
+**Author:** Rohit Ranjan Kumar | B.Tech, Manipal University Jaipur
 
-- Optimal Threshold (Youden Index)
-
-- Optimal threshold: 0.598
-
-- Accuracy @ optimal threshold: 0.9552
-
-## Future Improvements
-
-- In future updates, the model will be extended with:
-
-- Training on larger datasets like CBIS-DDSM
-
-- Adding EfficientNet / Vision Transformers
-
-- Multi-magnification learning
-
-- Improved explainability (Score-CAM, Integrated Gradients)
-
-- Full web deployment version
-
-## Author
-Rohit Ranjan Kumar
-B.Tech Manipal University Jaipur
+</div>
