@@ -6,6 +6,59 @@ from PIL import Image
 import numpy as np
 import cv2
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  # Load .env file
+
+# NLP Report Generation
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
+
+
+def generate_clinical_report(label, confidence, gradcam_stats, api_key):
+    """Generate a clinical report using Google Gemini LLM."""
+    if not api_key or not GENAI_AVAILABLE:
+        return None
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.0-flash")
+
+        prompt = f"""You are an expert breast pathology AI assistant. Based on the following 
+computational analysis of a breast histopathology image, generate a detailed, professional 
+clinical report. The report MUST be between 200 to 300 words.
+
+## Analysis Results
+- **Prediction:** {label}
+- **Model Confidence:** {confidence:.1%}
+- **Grad-CAM Activation Summary:**
+  - Mean activation intensity: {gradcam_stats['mean']:.3f}
+  - Max activation intensity: {gradcam_stats['max']:.3f}
+  - Activation spread (std): {gradcam_stats['std']:.3f}
+  - High-activation area (>50% threshold): {gradcam_stats['coverage']:.1%} of image
+
+## Instructions
+1. Write a **Clinical Summary** (4-5 sentences) interpreting the prediction, confidence level, 
+   and what the Grad-CAM activation pattern suggests about tissue morphology.
+2. Write a **Key Findings** section with 4-5 bullet points on cellular/tissue features typically 
+   associated with this classification. Each bullet point should have a brief explanation.
+3. Write a **Tissue Characteristics** section (2-3 sentences) describing the expected 
+   histological patterns for this classification.
+4. Write a **Recommendation** (2-3 sentences) on suggested clinical next steps.
+5. Write a brief **Disclaimer** stating this is AI-assisted and needs pathologist review.
+
+IMPORTANT: The total report must be 200-300 words. Use professional medical language. 
+Do NOT diagnose directly - frame this as "computational analysis suggests" or "model indicates".
+
+Format the output in clean Markdown with proper headings."""
+
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f" Report generation failed: {str(e)}"
 
 class HybridDenseNetModel(nn.Module):
     def __init__(self, engineered_feature_dim, num_classes=1, freeze_backbone=True):
@@ -68,23 +121,26 @@ model = HybridDenseNetModel(engineered_feature_dim=ENGINEERED_FEATURE_DIM).to(DE
 
 def load_model_checkpoint(model_paths, device):
     errors = []
+    # Resolve paths relative to this script's directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     for path in model_paths:
-        if not os.path.exists(path):
-            msg = f"Checkpoint not found: {path}"
-            print(f"⚠️ {msg}")
+        full_path = os.path.join(script_dir, path)
+        if not os.path.exists(full_path):
+            msg = f"Checkpoint not found: {full_path}"
+            print(f"[WARN] {msg}")
             errors.append(msg)
             continue
         
         # Try multiple loading strategies
         strategies = [
-            ("weights_only=False", lambda: torch.load(path, map_location=device, weights_only=False)),
-            ("weights_only=True", lambda: torch.load(path, map_location=device, weights_only=True)),
-            ("pickle legacy", lambda: torch.load(path, map_location=device, pickle_module=__import__('pickle'))),
+            ("weights_only=False", lambda: torch.load(full_path, map_location=device, weights_only=False)),
+            ("weights_only=True", lambda: torch.load(full_path, map_location=device, weights_only=True)),
+            ("pickle legacy", lambda: torch.load(full_path, map_location=device, pickle_module=__import__('pickle'))),
         ]
         
         for strategy_name, load_fn in strategies:
             try:
-                print(f"🔄 Attempting to load: {path} (strategy: {strategy_name})")
+                print(f"[LOAD] Attempting to load: {path} (strategy: {strategy_name})")
                 checkpoint = load_fn()
                 state_dict = checkpoint.get("model_state_dict", checkpoint)
                 
@@ -92,30 +148,30 @@ def load_model_checkpoint(model_paths, device):
                 missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
                 
                 if missing_keys:
-                    print(f"  ⚠️ Missing keys: {len(missing_keys)}")
+                    print(f"  [WARN] Missing keys: {len(missing_keys)}")
                 if unexpected_keys:
-                    print(f"  ⚠️ Unexpected keys: {len(unexpected_keys)}")
+                    print(f"  [WARN] Unexpected keys: {len(unexpected_keys)}")
                 
-                print(f"✅ Successfully loaded model weights from: {path}")
+                print(f"[OK] Successfully loaded model weights from: {path}")
                 return True
                 
             except RuntimeError as e:
                 if "__path__._path" in str(e) or "does not exist" in str(e):
-                    print(f"  ⚠️ {strategy_name} failed (serialization issue), trying next strategy...")
+                    print(f"  [WARN] {strategy_name} failed (serialization issue), trying next strategy...")
                     continue
                 else:
                     msg = f"{path} ({strategy_name}): {type(e).__name__}: {str(e)[:100]}"
-                    print(f"  ❌ {type(e).__name__}: {str(e)[:100]}")
+                    print(f"  [ERR] {type(e).__name__}: {str(e)[:100]}")
                     errors.append(msg)
                     break  # Try next file
             except Exception as e:
                 msg = f"{path} ({strategy_name}): {type(e).__name__}: {str(e)[:100]}"
-                print(f"  ❌ {type(e).__name__}: {str(e)[:100]}")
+                print(f"  [ERR] {type(e).__name__}: {str(e)[:100]}")
                 errors.append(msg)
                 break  # Try next file
     
     # If we get here, no checkpoint loaded successfully
-    error_summary = "\n".join(f"  • {err}" for err in errors)
+    error_summary = "\n".join(f"  - {err}" for err in errors)
     raise FileNotFoundError(f"No valid model checkpoint found.\n\nErrors:\n{error_summary}")
 
 load_model_checkpoint(["best_hybrid_densenet.pth", "best_densenet_model.pth"], DEVICE)
@@ -196,19 +252,65 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225])
 ])
 
-# 💻 Streamlit Interface
+# --- Fallback explanation (used when no API key is set) ---
+def _show_fallback_explanation(label):
+    if label == "Malignant":
+        st.markdown("""
+        ###  Malignant Tissue Features
+        ** Cellular Morphology**
+        - Enlarged, irregular nuclei and coarse chromatin  
+        - Prominent nucleoli and abnormal mitotic activity  
+        - High **nuclear-to-cytoplasmic ratio**  
+
+        ** Tissue Architecture**
+        - Disrupted glandular formation  
+        - Dense cell clusters and stromal invasion  
+
+        ** Texture & Optical Patterns**
+        - High **GLCM contrast** and **entropy**  
+        - Elevated **Laplacian variance** and chaotic gradients  
+
+         *Indicates disorganized growth and aggressive pathology.*
+        """)
+    elif label == "Benign":
+        st.markdown("""
+        ###  Benign Tissue Features
+        ** Cellular Morphology**
+        - Uniform, round nuclei and consistent cell shapes  
+        - Low **N/C ratio** and minimal mitotic activity  
+
+        ** Tissue Architecture**
+        - Well-defined and regular glandular structure  
+        - Smooth cell boundaries and preserved basement membrane  
+
+        ** Texture & Optical Patterns**
+        - Low GLCM contrast and consistent chromatin texture  
+        - Stable intensity distribution and uniform pixel variance  
+
+         *Indicates non-invasive, normal or benign morphology.*
+        """)
+    else:
+        st.markdown("""
+        ###  Indeterminate Zone
+        - Prediction falls near the decision threshold (0.45-0.55).  
+        - Indicates potential **borderline morphology** (e.g., atypical hyperplasia).  
+        - Recommend further **pathologist review or higher-resolution imaging.**
+        """)
+
+
+# Streamlit Interface
 st.set_page_config(page_title="Breast Cancer Detection (DenseNet Hybrid)", layout="centered", page_icon="🩺")
-st.title("🩺 Breast Cancer Detection — Hybrid DenseNet Model")
+st.title("Breast Cancer Detection — Hybrid DenseNet Model")
 st.caption("Combining **CNN imaging** with **engineered radiomic features** for interpretable diagnosis.")
 
 
-uploaded_file = st.file_uploader(" Upload an image...", type=["jpg", "jpeg", "png"])
+uploaded_file = st.file_uploader("Upload an image...", type=["jpg", "jpeg", "png"])
 
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption=" Uploaded Image", use_container_width=True)
+    st.image(image, caption="Uploaded Image", width="stretch")
 
-    if st.button(" Predict and Explain"):
+    if st.button("Predict and Explain"):
         try:
             img_tensor = transform(image).unsqueeze(0).to(DEVICE)
             engineered_features = torch.zeros((1, ENGINEERED_FEATURE_DIM)).to(DEVICE)
@@ -237,58 +339,54 @@ if uploaded_file:
             st.markdown(f"### Prediction: <span style='color:{color}'>{label}</span>", unsafe_allow_html=True)
             st.write(f"**Confidence:** {confidence:.2%}")
             st.progress(float(confidence))
-            st.image(overlayed, caption=" Grad-CAM Visualization", use_container_width=True)
+            st.image(overlayed, caption="Grad-CAM Visualization", width="stretch")
 
-            # Clinical explanation
-            if label == "Malignant":
-                st.markdown("""
-                ###  Malignant Tissue Features
-                **🧬 Cellular Morphology**
-                - Enlarged, irregular nuclei and coarse chromatin  
-                - Prominent nucleoli and abnormal mitotic activity  
-                - High **nuclear-to-cytoplasmic ratio**  
+            # Show fallback explanation
+            _show_fallback_explanation(label)
 
-                **🧫 Tissue Architecture**
-                - Disrupted glandular formation  
-                - Dense cell clusters and stromal invasion  
+            # Store results in session state for report generation
+            gradcam_stats = {
+                "mean": float(np.mean(gradcam)),
+                "max": float(np.max(gradcam)),
+                "std": float(np.std(gradcam)),
+                "coverage": float(np.mean(gradcam > 0.5)),
+            }
+            st.session_state["prediction_result"] = {
+                "label": label,
+                "confidence": confidence,
+                "gradcam_stats": gradcam_stats,
+            }
 
-                **🎨 Texture & Optical Patterns**
-                - High **GLCM contrast** and **entropy**  
-                - Elevated **Laplacian variance** and chaotic gradients  
-
-                 *Indicates disorganized growth and aggressive pathology.*
-                """)
-            elif label == "Benign":
-                st.markdown("""
-                ### 💚 Benign Tissue Features
-                **🧬 Cellular Morphology**
-                - Uniform, round nuclei and consistent cell shapes  
-                - Low **N/C ratio** and minimal mitotic activity  
-
-                **🧫 Tissue Architecture**
-                - Well-defined and regular glandular structure  
-                - Smooth cell boundaries and preserved basement membrane  
-
-                **🎨 Texture & Optical Patterns**
-                - Low GLCM contrast and consistent chromatin texture  
-                - Stable intensity distribution and uniform pixel variance  
-
-                💚 *Indicates non-invasive, normal or benign morphology.*
-                """)
-            else:
-                st.markdown("""
-                ### ⚪ Indeterminate Zone
-                - Prediction falls near the decision threshold (0.45–0.55).  
-                - Indicates potential **borderline morphology** (e.g., atypical hyperplasia).  
-                - Recommend further **pathologist review or higher-resolution imaging.**
-                """)
         except Exception as e:
             st.error(f"Error during prediction: {e}")
             import traceback
             st.text(traceback.format_exc())
 
-#  Sidebar Info
-st.sidebar.header("📘 Model Information")
+# --- Generate Report Button (shown after prediction) ---
+if "prediction_result" in st.session_state:
+    st.markdown("---")
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if api_key and GENAI_AVAILABLE:
+        if st.button("Generate AI Clinical Report"):
+            result = st.session_state["prediction_result"]
+            with st.spinner("Generating AI clinical report... please wait"):
+                report = generate_clinical_report(
+                    result["label"], result["confidence"],
+                    result["gradcam_stats"], api_key
+                )
+            if report:
+                st.markdown("### AI-Generated Clinical Report")
+                st.markdown(report)
+                st.caption("*This report is AI-generated and must be reviewed by a qualified pathologist.*")
+            else:
+                st.warning("Report generation returned empty. Please try again.")
+    else:
+        st.info("AI Report Generation is not available. Configure GEMINI_API_KEY in .env file to enable it.")
+
+
+
+# Sidebar Info
+st.sidebar.header("Model Information")
 st.sidebar.markdown(f"""
 **Architecture:** DenseNet-121 Hybrid  
 **Engineered Features:** {ENGINEERED_FEATURE_DIM}  
