@@ -25,3 +25,7 @@ lime
 
 # Web App (Frontend)
 streamlit
+
+# NLP / LLM Report Generation
+google-generativeai
+python-dotenv
