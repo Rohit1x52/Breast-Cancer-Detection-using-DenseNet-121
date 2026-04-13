@@ -19,6 +19,8 @@ figures/
 *.npy
 *.npz
 *.joblib
+best_densenet_model.pth
+best_hybrid_densenet.pth
 
 # Ignore hybrid / resnet pipelines
 resnet.py
