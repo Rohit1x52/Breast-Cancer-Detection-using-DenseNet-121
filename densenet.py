@@ -1,83 +1,86 @@
+import io
+import logging
+import os
+import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+import cv2
+import numpy as np
 import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import transforms, models
-from PIL import Image
-import numpy as np
-import cv2
-import os
 from dotenv import load_dotenv
+from PIL import Image
+from torchvision import models, transforms
 
-load_dotenv()  # Load .env file
+load_dotenv()
 
-# NLP Report Generation
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 try:
     import google.generativeai as genai
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
+    logger.warning("google-generativeai not installed. Report generation disabled.")
 
 
-def generate_clinical_report(label, confidence, gradcam_stats, api_key):
-    """Generate a clinical report using Google Gemini LLM."""
-    if not api_key or not GENAI_AVAILABLE:
-        return None
+ENGINEERED_FEATURE_DIM: int = 147
+MAX_IMAGE_BYTES: int = 10 * 1024 * 1024
+SUPPORTED_IMAGE_TYPES: Tuple[str, ...] = ("jpg", "jpeg", "png")
+MALIGNANT_THRESHOLD: float = 0.55
+BENIGN_THRESHOLD: float = 0.45
+GRADCAM_HIGH_ACTIVATION_CUTOFF: float = 0.5
 
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-2.0-flash")
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
-        prompt = f"""You are an expert breast pathology AI assistant. Based on the following 
-computational analysis of a breast histopathology image, generate a detailed, professional 
-clinical report. The report MUST be between 200 to 300 words.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-## Analysis Results
-- **Prediction:** {label}
-- **Model Confidence:** {confidence:.1%}
-- **Grad-CAM Activation Summary:**
-  - Mean activation intensity: {gradcam_stats['mean']:.3f}
-  - Max activation intensity: {gradcam_stats['max']:.3f}
-  - Activation spread (std): {gradcam_stats['std']:.3f}
-  - High-activation area (>50% threshold): {gradcam_stats['coverage']:.1%} of image
+IMAGE_TRANSFORM = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+])
 
-## Instructions
-1. Write a **Clinical Summary** (4-5 sentences) interpreting the prediction, confidence level, 
-   and what the Grad-CAM activation pattern suggests about tissue morphology.
-2. Write a **Key Findings** section with 4-5 bullet points on cellular/tissue features typically 
-   associated with this classification. Each bullet point should have a brief explanation.
-3. Write a **Tissue Characteristics** section (2-3 sentences) describing the expected 
-   histological patterns for this classification.
-4. Write a **Recommendation** (2-3 sentences) on suggested clinical next steps.
-5. Write a brief **Disclaimer** stating this is AI-assisted and needs pathologist review.
 
-IMPORTANT: The total report must be 200-300 words. Use professional medical language. 
-Do NOT diagnose directly - frame this as "computational analysis suggests" or "model indicates".
+@dataclass(frozen=True)
+class PredictionResult:
+    label: str
+    confidence: float
+    raw_probability: float
+    gradcam_map: np.ndarray
+    gradcam_stats: Dict[str, float]
+    overlaid_image: np.ndarray
 
-Format the output in clean Markdown with proper headings."""
 
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f" Report generation failed: {str(e)}"
+@dataclass(frozen=True)
+class GradCamStats:
+    mean: float
+    maximum: float
+    std: float
+    coverage: float
+
 
 class HybridDenseNetModel(nn.Module):
-    def __init__(self, engineered_feature_dim, num_classes=1, freeze_backbone=True):
-        super(HybridDenseNetModel, self).__init__()
+    def __init__(self, engineered_feature_dim: int, num_classes: int = 1, freeze_backbone: bool = True):
+        super().__init__()
 
-        # DenseNet-121 backbone (matching notebook architecture)
         self.backbone = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
-        
-        # Replace classifier with identity — we'll extract 1024-D features
-        num_ftrs = self.backbone.classifier.in_features  # 1024 for DenseNet-121
+        num_ftrs = self.backbone.classifier.in_features
         self.backbone.classifier = nn.Identity()
 
-        # Freeze early layers for stability if desired
         if freeze_backbone:
             for name, param in self.backbone.features.named_parameters():
-                if "denseblock4" not in name:  # only fine-tune last dense block
+                if "denseblock4" not in name:
                     param.requires_grad = False
 
-        # Engineered feature encoder (matching notebook)
         self.engineered_branch = nn.Sequential(
             nn.Linear(engineered_feature_dim, 256),
             nn.ReLU(inplace=True),
@@ -86,11 +89,10 @@ class HybridDenseNetModel(nn.Module):
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
             nn.BatchNorm1d(128),
-            nn.Dropout(0.2)
+            nn.Dropout(0.2),
         )
 
-        # Fusion Layer (CNN + Engineered) - matching notebook
-        fusion_input_dim = num_ftrs + 128  # 1024 (DenseNet) + 128 (engineered)
+        fusion_input_dim = num_ftrs + 128
         self.classifier = nn.Sequential(
             nn.Linear(fusion_input_dim, 512),
             nn.ReLU(inplace=True),
@@ -100,297 +102,517 @@ class HybridDenseNetModel(nn.Module):
             nn.ReLU(inplace=True),
             nn.BatchNorm1d(128),
             nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
+            nn.Linear(128, num_classes),
         )
 
-    def forward(self, image, engineered_features):
-        # CNN branch
-        cnn_feats = self.backbone(image)  # [B, 1024]
-        # Engineered branch
-        eng_feats = self.engineered_branch(engineered_features)  # [B, 128]
-        # Concatenate both feature spaces
+    def forward(self, image: torch.Tensor, engineered_features: torch.Tensor) -> torch.Tensor:
+        cnn_feats = self.backbone(image)
+        eng_feats = self.engineered_branch(engineered_features)
         fused = torch.cat([cnn_feats, eng_feats], dim=1)
-        # Final prediction
-        out = self.classifier(fused)
-        return out
+        return self.classifier(fused)
 
-#  Model Loading
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-ENGINEERED_FEATURE_DIM = 147  # Must match training setup
-model = HybridDenseNetModel(engineered_feature_dim=ENGINEERED_FEATURE_DIM).to(DEVICE)
 
-def load_model_checkpoint(model_paths, device):
-    errors = []
-    # Resolve paths relative to this script's directory
+@st.cache_resource(show_spinner="Loading model weights...")
+def load_model(engineered_feature_dim: int, device: torch.device) -> HybridDenseNetModel:
+    model = HybridDenseNetModel(engineered_feature_dim=engineered_feature_dim).to(device)
+    model = _load_checkpoint_into_model(model, device)
+    model.eval()
+    logger.info("Model loaded and set to eval mode on device: %s", device)
+    return model
+
+
+def _load_checkpoint_into_model(
+    model: HybridDenseNetModel, device: torch.device
+) -> HybridDenseNetModel:
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    for path in model_paths:
-        full_path = os.path.join(script_dir, path)
+    candidate_paths = ["best_hybrid_densenet.pth", "best_densenet_model.pth"]
+    errors = []
+
+    for relative_path in candidate_paths:
+        full_path = os.path.join(script_dir, relative_path)
         if not os.path.exists(full_path):
-            msg = f"Checkpoint not found: {full_path}"
-            print(f"[WARN] {msg}")
-            errors.append(msg)
+            logger.warning("Checkpoint not found: %s", full_path)
+            errors.append(f"File not found: {full_path}")
             continue
-        
-        # Try multiple loading strategies
-        strategies = [
-            ("weights_only=False", lambda: torch.load(full_path, map_location=device, weights_only=False)),
-            ("weights_only=True", lambda: torch.load(full_path, map_location=device, weights_only=True)),
-            ("pickle legacy", lambda: torch.load(full_path, map_location=device, pickle_module=__import__('pickle'))),
-        ]
-        
-        for strategy_name, load_fn in strategies:
+
+        for weights_only in (False, True):
             try:
-                print(f"[LOAD] Attempting to load: {path} (strategy: {strategy_name})")
-                checkpoint = load_fn()
+                checkpoint = torch.load(full_path, map_location=device, weights_only=weights_only)
                 state_dict = checkpoint.get("model_state_dict", checkpoint)
-                
-                # Load with strict=False to allow minor mismatches
-                missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-                
-                if missing_keys:
-                    print(f"  [WARN] Missing keys: {len(missing_keys)}")
-                if unexpected_keys:
-                    print(f"  [WARN] Unexpected keys: {len(unexpected_keys)}")
-                
-                print(f"[OK] Successfully loaded model weights from: {path}")
-                return True
-                
-            except RuntimeError as e:
-                if "__path__._path" in str(e) or "does not exist" in str(e):
-                    print(f"  [WARN] {strategy_name} failed (serialization issue), trying next strategy...")
-                    continue
-                else:
-                    msg = f"{path} ({strategy_name}): {type(e).__name__}: {str(e)[:100]}"
-                    print(f"  [ERR] {type(e).__name__}: {str(e)[:100]}")
-                    errors.append(msg)
-                    break  # Try next file
-            except Exception as e:
-                msg = f"{path} ({strategy_name}): {type(e).__name__}: {str(e)[:100]}"
-                print(f"  [ERR] {type(e).__name__}: {str(e)[:100]}")
-                errors.append(msg)
-                break  # Try next file
-    
-    # If we get here, no checkpoint loaded successfully
-    error_summary = "\n".join(f"  - {err}" for err in errors)
-    raise FileNotFoundError(f"No valid model checkpoint found.\n\nErrors:\n{error_summary}")
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                if missing:
+                    logger.warning("Missing keys (%d) from checkpoint: %s", len(missing), relative_path)
+                if unexpected:
+                    logger.warning("Unexpected keys (%d) in checkpoint: %s", len(unexpected), relative_path)
+                logger.info("Loaded checkpoint: %s (weights_only=%s)", relative_path, weights_only)
+                return model
+            except RuntimeError as exc:
+                logger.debug("Load attempt failed for %s (weights_only=%s): %s", relative_path, weights_only, exc)
+                errors.append(f"{relative_path} [weights_only={weights_only}]: {exc}")
+            except Exception as exc:
+                logger.error("Unexpected error loading %s: %s", relative_path, exc)
+                errors.append(f"{relative_path}: {exc}")
+                break
 
-load_model_checkpoint(["best_hybrid_densenet.pth", "best_densenet_model.pth"], DEVICE)
-model.eval()
+    error_detail = "\n".join(f"  {e}" for e in errors)
+    raise FileNotFoundError(
+        f"No valid model checkpoint could be loaded.\n\nAttempted paths and errors:\n{error_detail}"
+    )
 
-def generate_gradcam(model, image_tensor, engineered_features):
-    grad = None
-    activation = None
 
-    def backward_hook(module, grad_input, grad_output):
-        nonlocal grad
-        grad = grad_output[0].detach()
+def validate_uploaded_image(uploaded_file) -> Tuple[bool, str]:
+    if uploaded_file is None:
+        return False, "No file provided."
 
-    def forward_hook(module, input, output):
-        nonlocal activation
-        activation = output.detach()
+    raw_bytes = uploaded_file.getvalue()
+    if len(raw_bytes) > MAX_IMAGE_BYTES:
+        return False, f"File size exceeds {MAX_IMAGE_BYTES // (1024 * 1024)} MB limit."
 
-    # For DenseNet, target the last conv layer in denseblock4
-    if hasattr(model.backbone.features, 'denseblock4'):
+    try:
+        img = Image.open(io.BytesIO(raw_bytes))
+        img.verify()
+    except Exception:
+        return False, "The uploaded file is not a valid or supported image."
+
+    return True, ""
+
+
+def preprocess_image(image: Image.Image) -> torch.Tensor:
+    return IMAGE_TRANSFORM(image).unsqueeze(0).to(DEVICE)
+
+
+def compute_gradcam(
+    model: HybridDenseNetModel,
+    image_tensor: torch.Tensor,
+    engineered_features: torch.Tensor,
+) -> np.ndarray:
+    model.eval()
+
+    captured_grad: Optional[torch.Tensor] = None
+    captured_activation: Optional[torch.Tensor] = None
+
+    def _forward_hook(module, input, output):
+        nonlocal captured_activation
+        captured_activation = output.detach()
+
+    def _backward_hook(module, grad_input, grad_output):
+        nonlocal captured_grad
+        captured_grad = grad_output[0].detach()
+
+    if hasattr(model.backbone.features, "denseblock4"):
         target_layer = model.backbone.features.denseblock4
     else:
-        target_layer = model.backbone.features[-1]
-    
-    handle_f = target_layer.register_forward_hook(forward_hook)
-    handle_b = target_layer.register_full_backward_hook(backward_hook)
+        target_layer = list(model.backbone.features.children())[-1]
 
-    image_tensor.requires_grad_(True)
-    
-    with torch.enable_grad():
-        output = model(image_tensor, engineered_features)
-        score = torch.sigmoid(output).sum()
-        model.zero_grad(set_to_none=True)
-        score.backward(retain_graph=True)
+    fwd_handle = target_layer.register_forward_hook(_forward_hook)
+    bwd_handle = target_layer.register_full_backward_hook(_backward_hook)
 
-    weights = grad.mean(dim=[2, 3], keepdim=True)
-    gradcam = torch.sum(weights * activation, dim=1).squeeze()
-    gradcam = torch.relu(gradcam)
-    gradcam -= gradcam.min()
-    gradcam /= (gradcam.max() + 1e-8)
+    input_tensor = image_tensor.clone().requires_grad_(True)
 
-    handle_f.remove()
-    handle_b.remove()
-    return gradcam.cpu().numpy()
+    try:
+        with torch.enable_grad():
+            output = model(input_tensor, engineered_features)
+            score = torch.sigmoid(output).sum()
+            model.zero_grad(set_to_none=True)
+            score.backward()
+    finally:
+        fwd_handle.remove()
+        bwd_handle.remove()
 
-def overlay_heatmap(img, cam):
-    """Overlay heatmap on image. img can be PIL Image or numpy array."""
-    # Convert to numpy if needed
-    if not isinstance(img, np.ndarray):
-        img_np = np.array(img)
+    if captured_grad is None or captured_activation is None:
+        logger.error("Grad-CAM hooks did not capture gradient or activation.")
+        raise RuntimeError("Grad-CAM failed: gradient or activation not captured.")
+
+    weights = captured_grad.mean(dim=[2, 3], keepdim=True)
+    cam = torch.sum(weights * captured_activation, dim=1).squeeze()
+    cam = torch.relu(cam)
+
+    cam_min = cam.min()
+    cam_max = cam.max()
+    if cam_max - cam_min > 1e-8:
+        cam = (cam - cam_min) / (cam_max - cam_min)
     else:
-        img_np = img
-    
-    # Get image dimensions (height, width)
-    h, w = img_np.shape[:2]
-    
-    # Resize and normalize CAM
-    cam = np.clip(cam, 0, 1)
-    cam = cv2.resize(cam, (w, h))
-    
-    # Apply colormap
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-    heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)  # Convert BGR to RGB
-    heatmap = np.float32(heatmap) / 255
-    
-    # Normalize image
-    img_normalized = np.float32(img_np) / 255
-    
-    # Blend
-    overlayed = heatmap * 0.4 + img_normalized
-    overlayed = np.clip(overlayed, 0, 1)
-    return np.uint8(255 * overlayed)
+        cam = torch.zeros_like(cam)
 
-# 🧩 Image Preprocessing
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
+    return cam.cpu().numpy()
 
-# --- Fallback explanation (used when no API key is set) ---
-def _show_fallback_explanation(label):
+
+def compute_gradcam_stats(cam: np.ndarray) -> GradCamStats:
+    return GradCamStats(
+        mean=float(np.mean(cam)),
+        maximum=float(np.max(cam)),
+        std=float(np.std(cam)),
+        coverage=float(np.mean(cam > GRADCAM_HIGH_ACTIVATION_CUTOFF)),
+    )
+
+
+def overlay_heatmap_on_image(original_image: np.ndarray, cam: np.ndarray) -> np.ndarray:
+    if cam.ndim != 2:
+        raise ValueError(f"CAM must be 2D, got shape {cam.shape}.")
+
+    h, w = original_image.shape[:2]
+    cam_clipped = np.clip(cam, 0.0, 1.0)
+    cam_resized = cv2.resize(cam_clipped, (w, h))
+
+    heatmap_bgr = cv2.applyColorMap(np.uint8(255 * cam_resized), cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+    heatmap_float = heatmap_rgb.astype(np.float32) / 255.0
+
+    image_float = original_image.astype(np.float32) / 255.0
+
+    blended = np.clip(heatmap_float * 0.4 + image_float, 0.0, 1.0)
+    return (blended * 255).astype(np.uint8)
+
+
+def classify_prediction(probability: float) -> Tuple[str, str, float]:
+    if probability > MALIGNANT_THRESHOLD:
+        return "Malignant", "#c0392b", probability
+    elif probability < BENIGN_THRESHOLD:
+        return "Benign", "#27ae60", 1.0 - probability
+    else:
+        return "Indeterminate", "#e67e22", abs(probability - 0.5) * 2
+
+
+def run_inference(
+    model: HybridDenseNetModel,
+    image: Image.Image,
+    engineered_feature_dim: int,
+) -> PredictionResult:
+    img_tensor = preprocess_image(image)
+    eng_features = torch.zeros((1, engineered_feature_dim), device=DEVICE)
+
+    with torch.no_grad():
+        output = model(img_tensor, eng_features)
+        probability = torch.sigmoid(output).item()
+
+    label, _, confidence = classify_prediction(probability)
+
+    cam = compute_gradcam(model, img_tensor, eng_features)
+    stats = compute_gradcam_stats(cam)
+    overlaid = overlay_heatmap_on_image(np.array(image), cam)
+
+    return PredictionResult(
+        label=label,
+        confidence=confidence,
+        raw_probability=probability,
+        gradcam_map=cam,
+        gradcam_stats={
+            "mean": stats.mean,
+            "max": stats.maximum,
+            "std": stats.std,
+            "coverage": stats.coverage,
+        },
+        overlaid_image=overlaid,
+    )
+
+
+REPORT_PROMPT_TEMPLATE = """You are an expert breast pathology AI assistant. Based on the following computational analysis of a breast histopathology image, generate a detailed, professional clinical report. The report MUST be between 200 to 300 words.
+
+Analysis Results
+Prediction: {label}
+Model Confidence: {confidence:.1%}
+Grad-CAM Activation Summary:
+  Mean activation intensity: {mean:.3f}
+  Max activation intensity: {maximum:.3f}
+  Activation spread (std): {std:.3f}
+  High-activation area (>50% threshold): {coverage:.1%} of image
+
+Instructions
+1. Write a Clinical Summary (4-5 sentences) interpreting the prediction, confidence level, and what the Grad-CAM activation pattern suggests about tissue morphology.
+2. Write a Key Findings section with 4-5 bullet points on cellular/tissue features typically associated with this classification.
+3. Write a Tissue Characteristics section (2-3 sentences) describing expected histological patterns for this classification.
+4. Write a Recommendation (2-3 sentences) on suggested clinical next steps.
+5. Write a brief Disclaimer stating this is AI-assisted and requires pathologist review.
+
+IMPORTANT: Total report must be 200-300 words. Use professional medical language. Do NOT diagnose directly. Frame findings as "computational analysis suggests" or "model indicates". Format output in clean Markdown with proper headings."""
+
+
+def generate_clinical_report(
+    label: str,
+    confidence: float,
+    gradcam_stats: Dict[str, float],
+    api_key: str,
+) -> Optional[str]:
+    if not api_key or not api_key.strip():
+        logger.warning("generate_clinical_report called without a valid API key.")
+        return None
+    if not GENAI_AVAILABLE:
+        logger.warning("google-generativeai not installed.")
+        return None
+
+    prompt = REPORT_PROMPT_TEMPLATE.format(
+        label=label,
+        confidence=confidence,
+        mean=gradcam_stats["mean"],
+        maximum=gradcam_stats["max"],
+        std=gradcam_stats["std"],
+        coverage=gradcam_stats["coverage"],
+    )
+
+    try:
+        genai.configure(api_key=api_key.strip())
+        llm = genai.GenerativeModel("gemini-2.0-flash")
+        response = llm.generate_content(prompt)
+        logger.info("Clinical report generated successfully.")
+        return response.text
+    except Exception as exc:
+        logger.error("Report generation failed: %s", exc)
+        return f"Report generation failed: {exc}"
+
+
+def render_tissue_features(label: str) -> None:
     if label == "Malignant":
         st.markdown("""
-        ###  Malignant Tissue Features
-        ** Cellular Morphology**
-        - Enlarged, irregular nuclei and coarse chromatin  
-        - Prominent nucleoli and abnormal mitotic activity  
-        - High **nuclear-to-cytoplasmic ratio**  
+**Cellular Morphology**
 
-        ** Tissue Architecture**
-        - Disrupted glandular formation  
-        - Dense cell clusters and stromal invasion  
+Enlarged and irregularly shaped nuclei with coarse chromatin patterns. Prominent nucleoli with elevated nuclear-to-cytoplasmic ratio. High mitotic activity with abnormal mitotic figures.
 
-        ** Texture & Optical Patterns**
-        - High **GLCM contrast** and **entropy**  
-        - Elevated **Laplacian variance** and chaotic gradients  
+**Tissue Architecture**
 
-         *Indicates disorganized growth and aggressive pathology.*
+Loss of organized glandular formation with dense cellular clustering. Stromal invasion and disruption of the basement membrane are characteristic.
+
+**Texture and Optical Patterns**
+
+Elevated GLCM contrast and entropy reflect disorganized cellular arrangement. High Laplacian variance and chaotic intensity gradients indicate aggressive tissue morphology.
         """)
     elif label == "Benign":
         st.markdown("""
-        ###  Benign Tissue Features
-        ** Cellular Morphology**
-        - Uniform, round nuclei and consistent cell shapes  
-        - Low **N/C ratio** and minimal mitotic activity  
+**Cellular Morphology**
 
-        ** Tissue Architecture**
-        - Well-defined and regular glandular structure  
-        - Smooth cell boundaries and preserved basement membrane  
+Uniform, round to oval nuclei with consistent size and smooth nuclear membranes. Low nuclear-to-cytoplasmic ratio with minimal or absent mitotic activity.
 
-        ** Texture & Optical Patterns**
-        - Low GLCM contrast and consistent chromatin texture  
-        - Stable intensity distribution and uniform pixel variance  
+**Tissue Architecture**
 
-         *Indicates non-invasive, normal or benign morphology.*
+Well-defined glandular structures with preserved basement membrane integrity. Smooth cell boundaries and organized stromal arrangement.
+
+**Texture and Optical Patterns**
+
+Low GLCM contrast and consistent chromatin texture. Stable intensity distribution with uniform pixel variance indicating homogeneous tissue organization.
         """)
     else:
         st.markdown("""
-        ###  Indeterminate Zone
-        - Prediction falls near the decision threshold (0.45-0.55).  
-        - Indicates potential **borderline morphology** (e.g., atypical hyperplasia).  
-        - Recommend further **pathologist review or higher-resolution imaging.**
+**Indeterminate Classification**
+
+The prediction probability falls within the decision boundary zone (0.45 to 0.55), indicating ambiguous morphological features. This may represent borderline pathology such as atypical ductal hyperplasia or other intermediate-grade lesions. Pathologist review with additional clinical correlation is strongly recommended.
         """)
 
 
-# Streamlit Interface
-st.set_page_config(page_title="Breast Cancer Detection (DenseNet Hybrid)", layout="centered", page_icon="🩺")
-st.title("Breast Cancer Detection — Hybrid DenseNet Model")
-st.caption("Combining **CNN imaging** with **engineered radiomic features** for interpretable diagnosis.")
+def render_sidebar(device: torch.device, engineered_feature_dim: int) -> None:
+    with st.sidebar:
+        st.header("Model Information")
+        st.markdown(f"""
+**Architecture:** DenseNet-121 Hybrid
+
+**Backbone:** DenseNet-121 pretrained on ImageNet
+
+**Engineered Feature Dimension:** {engineered_feature_dim}
+
+**Fusion Strategy:** Late fusion (CNN + radiomic branch)
+
+**Explainability:** Grad-CAM on denseblock4
+
+**Target Classes:** Benign, Malignant
+
+**Dataset:** BreakHis
+
+**Device:** {"CUDA" if device.type == "cuda" else "CPU"}
+        """)
+
+        st.header("Classification Thresholds")
+        st.markdown(f"""
+**Malignant:** probability > {MALIGNANT_THRESHOLD}
+
+**Benign:** probability < {BENIGN_THRESHOLD}
+
+**Indeterminate:** {BENIGN_THRESHOLD} to {MALIGNANT_THRESHOLD}
+        """)
+
+        st.header("Image Requirements")
+        st.markdown(f"""
+**Formats:** {", ".join(t.upper() for t in SUPPORTED_IMAGE_TYPES)}
+
+**Max file size:** {MAX_IMAGE_BYTES // (1024 * 1024)} MB
+
+**Recommended:** H&E stained histopathology patches at 40x, 100x, 200x, or 400x magnification
+        """)
 
 
-uploaded_file = st.file_uploader("Upload an image...", type=["jpg", "jpeg", "png"])
+def main() -> None:
+    st.set_page_config(
+        page_title="Breast Cancer Detection",
+        layout="wide",
+        page_icon="pathology",
+        initial_sidebar_state="expanded",
+    )
 
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", width="stretch")
+    st.title("Breast Cancer Detection")
+    st.caption(
+        "Hybrid DenseNet-121 model combining deep convolutional features with engineered "
+        "radiomic descriptors for interpretable histopathology classification."
+    )
 
-    if st.button("Predict and Explain"):
-        try:
-            img_tensor = transform(image).unsqueeze(0).to(DEVICE)
-            engineered_features = torch.zeros((1, ENGINEERED_FEATURE_DIM)).to(DEVICE)
+    render_sidebar(DEVICE, ENGINEERED_FEATURE_DIM)
 
-            with torch.no_grad():
-                output = model(img_tensor, engineered_features)
-                prob = torch.sigmoid(output).item()
+    try:
+        model = load_model(ENGINEERED_FEATURE_DIM, DEVICE)
+    except FileNotFoundError as exc:
+        st.error("Model checkpoint could not be loaded.")
+        st.code(str(exc))
+        st.stop()
+    except Exception as exc:
+        st.error(f"Unexpected error during model initialization: {exc}")
+        logger.exception("Model initialization failed.")
+        st.stop()
 
-            # Determine prediction class
-            if 0.45 <= prob <= 0.55:
-                label = "Indeterminate"
-                color = "orange"
-                confidence = 0.5
-            elif prob > 0.5:
-                label = "Malignant"
-                color = "red"
-                confidence = prob
-            else:
-                label = "Benign"
-                color = "green"
-                confidence = 1 - prob
+    uploaded_file = st.file_uploader(
+        "Upload a histopathology image",
+        type=list(SUPPORTED_IMAGE_TYPES),
+        help="Upload an H&E stained breast histopathology image for analysis.",
+    )
 
-            gradcam = generate_gradcam(model, img_tensor, engineered_features)
-            overlayed = overlay_heatmap(np.array(image), gradcam)
+    if uploaded_file is not None:
+        if st.session_state.get("last_uploaded_filename") != uploaded_file.name:
+            st.session_state.pop("prediction_result", None)
+            st.session_state["last_uploaded_filename"] = uploaded_file.name
 
-            st.markdown(f"### Prediction: <span style='color:{color}'>{label}</span>", unsafe_allow_html=True)
-            st.write(f"**Confidence:** {confidence:.2%}")
-            st.progress(float(confidence))
-            st.image(overlayed, caption="Grad-CAM Visualization", width="stretch")
+        valid, validation_message = validate_uploaded_image(uploaded_file)
+        if not valid:
+            st.error(f"Invalid image: {validation_message}")
+            st.stop()
 
-            # Show fallback explanation
-            _show_fallback_explanation(label)
+        raw_bytes = uploaded_file.getvalue()
+        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
-            # Store results in session state for report generation
-            gradcam_stats = {
-                "mean": float(np.mean(gradcam)),
-                "max": float(np.max(gradcam)),
-                "std": float(np.std(gradcam)),
-                "coverage": float(np.mean(gradcam > 0.5)),
-            }
-            st.session_state["prediction_result"] = {
-                "label": label,
-                "confidence": confidence,
-                "gradcam_stats": gradcam_stats,
-            }
+        col_image, col_controls = st.columns([2, 1])
+        with col_image:
+            st.image(image, caption="Uploaded image", use_container_width=True)
+        with col_controls:
+            st.markdown(f"""
+**Filename:** {uploaded_file.name}
 
-        except Exception as e:
-            st.error(f"Error during prediction: {e}")
-            import traceback
-            st.text(traceback.format_exc())
+**Format:** {image.format or uploaded_file.type}
 
-# --- Generate Report Button (shown after prediction) ---
-if "prediction_result" in st.session_state:
-    st.markdown("---")
-    api_key = os.getenv("GEMINI_API_KEY", "")
-    if api_key and GENAI_AVAILABLE:
-        if st.button("Generate AI Clinical Report"):
-            result = st.session_state["prediction_result"]
-            with st.spinner("Generating AI clinical report... please wait"):
-                report = generate_clinical_report(
-                    result["label"], result["confidence"],
-                    result["gradcam_stats"], api_key
-                )
-            if report:
-                st.markdown("### AI-Generated Clinical Report")
-                st.markdown(report)
-                st.caption("*This report is AI-generated and must be reviewed by a qualified pathologist.*")
-            else:
-                st.warning("Report generation returned empty. Please try again.")
-    else:
-        st.info("AI Report Generation is not available. Configure GEMINI_API_KEY in .env file to enable it.")
+**Dimensions:** {image.width} x {image.height} px
+
+**File size:** {len(raw_bytes) / 1024:.1f} KB
+            """)
+
+            run_analysis = st.button("Run Analysis", type="primary", use_container_width=True)
+
+        if run_analysis:
+            with st.spinner("Running inference and computing Grad-CAM..."):
+                try:
+                    result = run_inference(model, image, ENGINEERED_FEATURE_DIM)
+                    st.session_state["prediction_result"] = result
+                    logger.info(
+                        "Inference complete: label=%s confidence=%.4f prob=%.4f",
+                        result.label,
+                        result.confidence,
+                        result.raw_probability,
+                    )
+                except Exception as exc:
+                    st.error("Analysis failed. See details below.")
+                    st.code(traceback.format_exc())
+                    logger.exception("Inference failed for file: %s", uploaded_file.name)
+                    st.stop()
+
+    if "prediction_result" in st.session_state:
+        result: PredictionResult = st.session_state["prediction_result"]
+        _, color, _ = classify_prediction(result.raw_probability)
+
+        st.divider()
+        st.subheader("Analysis Results")
+
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        with metric_col1:
+            st.metric("Prediction", result.label)
+        with metric_col2:
+            st.metric("Confidence", f"{result.confidence:.2%}")
+        with metric_col3:
+            st.metric("Raw Probability", f"{result.raw_probability:.4f}")
+        with metric_col4:
+            st.metric("Grad-CAM Coverage", f"{result.gradcam_stats['coverage']:.1%}")
+
+        st.markdown(
+            f"<div style='padding:12px;border-left:4px solid {color};background:#f8f9fa;"
+            f"border-radius:4px;margin:12px 0'>"
+            f"<strong>Classification: {result.label}</strong> "
+            f"with {result.confidence:.2%} confidence"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.progress(float(result.confidence), text=f"Confidence: {result.confidence:.2%}")
+
+        viz_col1, viz_col2 = st.columns(2)
+        with viz_col1:
+            st.image(
+                np.array(image) if uploaded_file else result.overlaid_image,
+                caption="Original image",
+                use_container_width=True,
+            )
+        with viz_col2:
+            st.image(
+                result.overlaid_image,
+                caption="Grad-CAM activation overlay",
+                use_container_width=True,
+            )
+
+        with st.expander("Grad-CAM Statistics", expanded=False):
+            stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+            with stat_col1:
+                st.metric("Mean Activation", f"{result.gradcam_stats['mean']:.4f}")
+            with stat_col2:
+                st.metric("Max Activation", f"{result.gradcam_stats['max']:.4f}")
+            with stat_col3:
+                st.metric("Activation Std", f"{result.gradcam_stats['std']:.4f}")
+            with stat_col4:
+                st.metric("High-Activation Coverage", f"{result.gradcam_stats['coverage']:.2%}")
+
+        st.divider()
+        st.subheader("Tissue Feature Analysis")
+        render_tissue_features(result.label)
+
+        st.divider()
+        st.subheader("AI Clinical Report")
+
+        api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+        if api_key and GENAI_AVAILABLE:
+            if st.button("Generate Clinical Report", type="secondary"):
+                with st.spinner("Generating clinical report via Gemini..."):
+                    report = generate_clinical_report(
+                        result.label,
+                        result.confidence,
+                        result.gradcam_stats,
+                        api_key,
+                    )
+                if report and not report.startswith("Report generation failed"):
+                    st.markdown(report)
+                    st.caption(
+                        "This report is AI-generated and must be reviewed by a qualified "
+                        "pathologist before any clinical decision is made."
+                    )
+                else:
+                    st.error(report or "Report generation returned an empty response.")
+        elif not GENAI_AVAILABLE:
+            st.info(
+                "Install google-generativeai to enable AI report generation: "
+                "pip install google-generativeai"
+            )
+        else:
+            st.info(
+                "Set GEMINI_API_KEY in your .env file to enable AI-generated clinical reports."
+            )
+
+        st.divider()
+        st.caption(
+            "This application is intended for research and educational purposes only. "
+            "It is not a certified medical device and must not be used as a substitute "
+            "for professional pathological diagnosis. All results require review by a "
+            "qualified pathologist."
+        )
 
 
-
-# Sidebar Info
-st.sidebar.header("Model Information")
-st.sidebar.markdown(f"""
-**Architecture:** DenseNet-121 Hybrid  
-**Engineered Features:** {ENGINEERED_FEATURE_DIM}  
-**Device:** {'CUDA' if torch.cuda.is_available() else 'CPU'}  
-**Explainability:** Grad-CAM  
-**Dataset:** BreakHis (Benign vs Malignant)  
-""")
+if __name__ == "__main__":
+    main()
